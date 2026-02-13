@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# App bundle
+WhisperGUI.app/
+
+# Output files
+*.txt
+!README.md
+
+# Error logs
+*.log
