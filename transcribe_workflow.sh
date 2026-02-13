@@ -25,10 +25,19 @@ CONCAT_DURATION_SEC=0
 JOBS="${WHISPER_JOBS:-4}"
 THREADS="${WHISPER_THREADS:-4}"
 SEGMENT_TIME="${WHISPER_SEGMENT_TIME:-60}"
+RETRY_COUNT="${WHISPER_RETRY_COUNT:-2}"
+RETRY_BACKOFF_SEC="${WHISPER_RETRY_BACKOFF_SEC:-1}"
 
 is_positive_int() {
     case "${1:-}" in
         ''|*[!0-9]*|0) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+is_non_negative_int() {
+    case "${1:-}" in
+        ''|*[!0-9]*) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -40,33 +49,88 @@ cleanup() {
     fi
 }
 
-run_whisper_single_pass() {
+run_whisper_with_retry() {
     local input_wav="$1"
-    local err_file="$WORK_DIR/whisper_single.err"
+    local run_label="$2"
+    local err_file="$3"
     local result=""
     local rc=0
+    local attempt=1
 
-    set +e
-    result="$(whisper-cli -l "$LANGUAGE" -m "$MODEL" -t "$THREADS" -nt --no-prints "$input_wav" 2>"$err_file")"
-    rc=$?
-    set -e
+    while [ "$attempt" -le "$RETRY_COUNT" ]; do
+        set +e
+        result="$(whisper-cli -l "$LANGUAGE" -m "$MODEL" -t "$THREADS" -nt --no-prints "$input_wav" 2>>"$err_file")"
+        rc=$?
+        set -e
 
-    if [ "$rc" -ne 0 ]; then
-        echo "Warning: whisper-cli GPU path failed. Retrying with CPU (-ng)..."
+        if [ "$rc" -eq 0 ]; then
+            printf "%s\n" "$result"
+            return 0
+        fi
+
+        echo "Warning: $run_label GPU attempt $attempt/$RETRY_COUNT failed. Retrying with CPU (-ng)..."
         set +e
         result="$(whisper-cli -ng -l "$LANGUAGE" -m "$MODEL" -t "$THREADS" -nt --no-prints "$input_wav" 2>>"$err_file")"
         rc=$?
         set -e
-    fi
 
-    if [ "$rc" -ne 0 ]; then
-        echo "Error: whisper-cli failed."
-        echo "---- whisper stderr (last 80 lines) ----"
-        tail -n 80 "$err_file" || true
-        return "$rc"
-    fi
+        if [ "$rc" -eq 0 ]; then
+            printf "%s\n" "$result"
+            return 0
+        fi
 
-    printf "%s\n" "$result"
+        if [ "$attempt" -lt "$RETRY_COUNT" ]; then
+            echo "Warning: $run_label attempt $attempt/$RETRY_COUNT failed. Retrying after ${RETRY_BACKOFF_SEC}s..."
+            sleep "$RETRY_BACKOFF_SEC"
+        fi
+        attempt=$((attempt + 1))
+    done
+
+    echo "Error: $run_label failed after $RETRY_COUNT attempt(s)."
+    echo "---- whisper stderr (last 80 lines for $run_label) ----"
+    tail -n 80 "$err_file" || true
+    return 1
+}
+
+run_whisper_single_pass() {
+    local input_wav="$1"
+    local err_file="$WORK_DIR/whisper_single.err"
+
+    : > "$err_file"
+    run_whisper_with_retry "$input_wav" "single-pass" "$err_file"
+}
+
+process_segment_file() {
+    local file="$1"
+    local filename
+    local txtfile
+    local seg_num
+    local start_sec
+    local start_min
+    local start_rem_sec
+    local timestamp
+    local err_file
+    local result
+
+    filename="$(basename "$file" .wav)"
+    txtfile="$TXT_DIR/${filename}.txt"
+
+    seg_num="${filename#segment_}"
+    start_sec=$((10#$seg_num * SEGMENT_TIME))
+    start_min=$((start_sec / 60))
+    start_rem_sec=$((start_sec % 60))
+    timestamp="$(printf "[%d:%02d]" "$start_min" "$start_rem_sec")"
+    err_file="$WORK_DIR/${filename}.err"
+
+    echo "[3/4] Processing ${filename}..."
+    : > "$err_file"
+    result="$(run_whisper_with_retry "$file" "$filename" "$err_file")"
+
+    {
+        echo "$timestamp"
+        printf "%s\n" "$result"
+        echo ""
+    } > "$txtfile"
 }
 
 get_audio_duration_sec() {
@@ -176,6 +240,16 @@ if ! is_positive_int "$SEGMENT_TIME"; then
     exit 1
 fi
 
+if ! is_positive_int "$RETRY_COUNT"; then
+    echo "Error: WHISPER_RETRY_COUNT must be a positive integer: '$RETRY_COUNT'"
+    exit 1
+fi
+
+if ! is_non_negative_int "$RETRY_BACKOFF_SEC"; then
+    echo "Error: WHISPER_RETRY_BACKOFF_SEC must be a non-negative integer: '$RETRY_BACKOFF_SEC'"
+    exit 1
+fi
+
 # --- Validation ---
 if [ -z "$INPUT_FILE" ]; then
     echo "Usage: $0 <input_audio_file> [output_text_file]"
@@ -218,6 +292,8 @@ echo "Language: $LANGUAGE"
 echo "Jobs:   $JOBS"
 echo "Threads per job: $THREADS"
 echo "Segment length: ${SEGMENT_TIME}s"
+echo "Retry count: $RETRY_COUNT"
+echo "Retry backoff: ${RETRY_BACKOFF_SEC}s"
 echo "WorkDir: $WORK_DIR"
 echo "------------------------------------"
 
@@ -261,29 +337,15 @@ export TXT_DIR
 export LANGUAGE
 export THREADS
 export SEGMENT_TIME
+export WORK_DIR
+export RETRY_COUNT
+export RETRY_BACKOFF_SEC
+export -f run_whisper_with_retry
+export -f process_segment_file
 
 stage_start_sec=$SECONDS
 find "$SEGMENTS_DIR" -name "segment_*.wav" | sort | \
-xargs -P "$JOBS" -I {} sh -c '
-    file="$1"
-    filename=$(basename "$file" .wav)
-    txtfile="$TXT_DIR/${filename}.txt"
-
-    seg_num=${filename#segment_}
-    start_sec=$((10#$seg_num * SEGMENT_TIME))
-    start_min=$((start_sec / 60))
-    start_rem_sec=$((start_sec % 60))
-    timestamp=$(printf "[%d:%02d]" "$start_min" "$start_rem_sec")
-
-    echo "[3/4] Processing ${filename}..."
-    result=$(whisper-cli -l "$LANGUAGE" -m "$MODEL" -t "$THREADS" -nt --no-prints "$file" || echo "")
-
-    if [ -n "$result" ]; then
-        echo "$timestamp" > "$txtfile"
-        echo "$result" >> "$txtfile"
-        echo "" >> "$txtfile"
-    fi
-' _ {}
+xargs -P "$JOBS" -I {} bash -c 'process_segment_file "$1"' _ {}
 TRANSCRIBE_DURATION_SEC=$((SECONDS - stage_start_sec))
 
 # --- 4. Concatenation ---

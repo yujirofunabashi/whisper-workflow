@@ -113,11 +113,32 @@ python3 whisper_gui.py
 6. 速度プリセット選択（`x1/x4/x8/x16`）と精度目安の表示
 7. Advanced で `single-pass` / `分割並列` を切替、並列ジョブ数（`JOBS`）を指定可能（上限4）
 8. Advanced の自動サフィックス保存で、比較実験時に設定別ファイル（例: `_x4_parallel_j2`）を自動作成
+9. 「比較実行」ボタンで `x1/x4/x8/x16 × single/parallel` を連続実行し、CSV付きで保存
 
 補足:
 
 - `whisper_gui.py` は自身の場所を基準に `transcribe_workflow.sh` を解決するため、別の作業ディレクトリから起動しても動作します。
 - 実行ログ末尾に性能指標が表示されます（`Convert/Transcribe/Concat/Total` 秒、`RTF`、`x realtime`）。
+- 分割並列ではセグメント単位で `GPU失敗 -> CPU再実行` とリトライを行います（`WHISPER_RETRY_COUNT` / `WHISPER_RETRY_BACKOFF_SEC`）。
+
+### 自動比較ベンチマーク（CSV出力）
+
+同じ音声を `x1/x4/x8/x16` と `single/parallel` の組み合わせで連続実行し、結果を1フォルダに保存します。
+
+```bash
+./benchmark_matrix.sh <音声ファイル> [出力フォルダ]
+```
+
+出力:
+
+- `benchmark.csv`（各回の計測結果）
+- `benchmark_median.csv`（設定ごとの中央値）
+- 設定別の実行ログと文字起こし結果テキスト
+
+デフォルトの計測手順:
+
+- ウォームアップ: 1回（`BENCHMARK_WARMUP_RUNS`）
+- 本計測: 3回（`BENCHMARK_MEASURE_RUNS`）
 
 ## 手動実行（トラブルシューティング用）
 
@@ -131,6 +152,7 @@ python3 whisper_gui.py
 ├── install_models.sh      # モデル一括インストール
 ├── whisper_gui.py         # GUI アプリ
 ├── transcribe_workflow.sh # 自動一括処理スクリプト (推奨)
+├── benchmark_matrix.sh    # 比較ベンチマーク実行 + CSV出力
 └── transcribe.sh          # 旧・手動用スクリプト
 
 ~/.cache/whisper-cpp/

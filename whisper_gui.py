@@ -21,11 +21,17 @@ class WhisperApp:
             os.path.dirname(os.path.abspath(__file__)),
             "transcribe_workflow.sh",
         )
+        self.benchmark_script_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "benchmark_matrix.sh",
+        )
 
         self.process = None
         self.is_running = False
         self.cancel_requested = False
         self.active_output_file = None
+        self.active_output_dir = None
+        self.active_run_kind = None
 
         self.preset_var = tk.StringVar(value="x1")
         self.parallel_mode_var = tk.BooleanVar(value=False)
@@ -70,6 +76,9 @@ class WhisperApp:
 
         self.start_btn = tk.Button(ctrl_frame, text="文字起こし開始", command=self.start_transcription)
         self.start_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.compare_btn = tk.Button(ctrl_frame, text="比較実行", command=self.start_benchmark)
+        self.compare_btn.pack(side=tk.LEFT, padx=(0, 6))
 
         self.cancel_btn = tk.Button(ctrl_frame, text="キャンセル", command=self.cancel_transcription, state=tk.DISABLED)
         self.cancel_btn.pack(side=tk.LEFT)
@@ -145,11 +154,17 @@ class WhisperApp:
         if missing:
             self.status_lbl.config(text="依存関係不足", fg="red")
             self.start_btn.config(state=tk.DISABLED)
+            self.compare_btn.config(state=tk.DISABLED)
             messagebox.showerror(
                 "セットアップが必要です",
                 "不足している依存関係/ファイル:\n\n" + "\n".join(f"- {item}" for item in missing),
                 parent=self.root,
             )
+            return
+
+        if not os.path.isfile(self.benchmark_script_path):
+            self.compare_btn.config(state=tk.DISABLED)
+            self.log("警告: benchmark_matrix.sh が見つからないため「比較実行」は無効です。\n")
 
     def activate_window(self):
         # Finder/app-launch can leave the window visible but not key.
@@ -229,11 +244,23 @@ class WhisperApp:
             counter += 1
         return candidate
 
+    def parse_jobs_value(self):
+        try:
+            jobs = int(self.jobs_var.get())
+        except ValueError:
+            return None, "並列ジョブ数は整数で指定してください。"
+
+        if jobs < 1 or jobs > self.max_parallel_jobs:
+            return None, f"並列ジョブ数は 1 から {self.max_parallel_jobs} の範囲で指定してください。"
+
+        return jobs, None
+
     def set_processing_state(self, running):
         self.is_running = running
 
         if running:
             self.start_btn.config(state=tk.DISABLED)
+            self.compare_btn.config(state=tk.DISABLED)
             self.cancel_btn.config(state=tk.NORMAL)
             self.input_entry.config(state=tk.DISABLED)
             self.output_entry.config(state=tk.DISABLED)
@@ -258,6 +285,10 @@ class WhisperApp:
             self.auto_suffix_chk.config(state=tk.NORMAL)
             self.on_parallel_mode_changed()
             self.status_lbl.config(text="準備完了", fg="gray")
+            if os.path.isfile(self.benchmark_script_path):
+                self.compare_btn.config(state=tk.NORMAL)
+            else:
+                self.compare_btn.config(state=tk.DISABLED)
 
     def start_transcription(self):
         if self.is_running:
@@ -298,18 +329,9 @@ class WhisperApp:
         parallel_enabled = self.parallel_mode_var.get()
         jobs = 1
         if parallel_enabled:
-            try:
-                jobs = int(self.jobs_var.get())
-            except ValueError:
-                messagebox.showerror("ジョブ数エラー", "並列ジョブ数は整数で指定してください。", parent=self.root)
-                return
-
-            if jobs < 1 or jobs > self.max_parallel_jobs:
-                messagebox.showerror(
-                    "ジョブ数エラー",
-                    f"並列ジョブ数は 1 から {self.max_parallel_jobs} の範囲で指定してください。",
-                    parent=self.root,
-                )
+            jobs, jobs_error = self.parse_jobs_value()
+            if jobs_error:
+                messagebox.showerror("ジョブ数エラー", jobs_error, parent=self.root)
                 return
 
             if preset == "x1":
@@ -353,17 +375,69 @@ class WhisperApp:
 
         self.cancel_requested = False
         self.set_processing_state(True)
+        self.active_run_kind = "transcription"
 
         threading.Thread(
             target=self.run_process,
-            args=(input_file, run_output, env),
+            args=([self.script_path, input_file, run_output], env),
             daemon=True,
         ).start()
 
-    def run_process(self, input_file, output_file, env):
+    def start_benchmark(self):
+        if self.is_running:
+            return
+
+        if not os.path.isfile(self.benchmark_script_path):
+            messagebox.showerror("実行エラー", "benchmark_matrix.sh が見つかりません。", parent=self.root)
+            return
+
+        input_file = self.input_entry.get().strip()
+        output_file = self.output_entry.get().strip()
+
+        if not input_file or not os.path.exists(input_file):
+            messagebox.showerror("入力エラー", "有効な音声ファイルを選択してください。", parent=self.root)
+            return
+
+        jobs, jobs_error = self.parse_jobs_value()
+        if jobs_error:
+            messagebox.showerror("ジョブ数エラー", jobs_error, parent=self.root)
+            return
+
+        base_dir = os.path.dirname(output_file) if output_file else os.getcwd()
+        if not base_dir:
+            base_dir = os.getcwd()
+        benchmark_dir = os.path.join(base_dir, f"benchmark_{time.strftime('%Y%m%d_%H%M%S')}")
+
+        env = os.environ.copy()
+        env["BENCHMARK_JOBS"] = str(jobs)
+
+        self.log_area.config(state=tk.NORMAL)
+        self.log_area.delete("1.0", tk.END)
+        self.log_area.config(state=tk.DISABLED)
+
+        self.log("=== Whisper 比較実行 ===\n")
+        self.log(f"入力: {input_file}\n")
+        self.log(f"出力フォルダ: {benchmark_dir}\n")
+        self.log("対象: x1/x4/x8/x16 × single/parallel\n")
+        self.log(f"並列ジョブ数: {jobs}\n")
+        self.log("-----------------------------\n")
+
+        self.active_output_dir = benchmark_dir
+        self.active_output_file = None
+        self.active_run_kind = "benchmark"
+        self.cancel_requested = False
+        self.set_processing_state(True)
+
+        threading.Thread(
+            target=self.run_process,
+            args=([self.benchmark_script_path, input_file, benchmark_dir], env),
+            daemon=True,
+        ).start()
+
+    def run_process(self, command, env):
         try:
             self.process = subprocess.Popen(
-                [self.script_path, input_file, output_file],
+                command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -391,14 +465,30 @@ class WhisperApp:
         elif retcode == 0:
             self.status_lbl.config(text="完了", fg="green")
             self.log("\n--- 処理が完了しました ---\n")
-            output_path = self.active_output_file or "（不明）"
-            messagebox.showinfo("成功", f"文字起こしが完了しました。\n\n出力:\n{output_path}", parent=self.root)
+            if self.active_run_kind == "benchmark":
+                output_path = self.active_output_dir or "（不明）"
+                messagebox.showinfo(
+                    "成功",
+                    "比較実行が完了しました。\n\n"
+                    f"出力フォルダ:\n{output_path}\n\n"
+                    f"CSV:\n{os.path.join(output_path, 'benchmark.csv')}\n"
+                    f"{os.path.join(output_path, 'benchmark_median.csv')}",
+                    parent=self.root,
+                )
+            else:
+                output_path = self.active_output_file or "（不明）"
+                messagebox.showinfo("成功", f"文字起こしが完了しました。\n\n出力:\n{output_path}", parent=self.root)
         else:
             self.status_lbl.config(text="失敗", fg="red")
             self.log(f"\n--- 処理に失敗しました（コード: {retcode}）---\n")
-            messagebox.showerror("エラー", "文字起こしに失敗しました。ログを確認してください。", parent=self.root)
+            if self.active_run_kind == "benchmark":
+                messagebox.showerror("エラー", "比較実行に失敗しました。ログを確認してください。", parent=self.root)
+            else:
+                messagebox.showerror("エラー", "文字起こしに失敗しました。ログを確認してください。", parent=self.root)
 
         self.active_output_file = None
+        self.active_output_dir = None
+        self.active_run_kind = None
         self.cancel_requested = False
 
     def cancel_transcription(self):
