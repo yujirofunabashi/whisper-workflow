@@ -42,7 +42,7 @@ curl -L -o ~/.cache/whisper-cpp/ggml-large-v3.bin \
 
 ## 使い方
 
-### 自動文字起こし（並列処理・一括実行）
+### 自動文字起こし（一括実行）
 
 作成した `transcribe_workflow.sh` を使用することで、変換から文字起こしまでを一括で行えます。
 
@@ -57,10 +57,10 @@ curl -L -o ~/.cache/whisper-cpp/ggml-large-v3.bin \
 このスクリプトは以下の処理を自動で行います：
 
 1. 音声ファイルを wav (16kHz) に変換
-2. 60秒ごとに分割
-3. 並列処理で高速に文字起こし（4プロセス同時実行）
-4. 結果を結合して出力
-5. 中間ファイルの自動削除
+2. （必要時のみ）`WHISPER_PREFLIGHT_NORMALIZE=1` で `loudnorm` を適用
+3. Whisper で文字起こし（プリセット `x1/x4/x8/x16` は single-pass）
+4. 結果を出力
+5. 中間ファイルを自動削除
 
 ### 速度プリセット（x1 / x4 / x8 / x16）
 
@@ -88,38 +88,117 @@ WHISPER_PRESET=x4 ./transcribe_workflow.sh <音声ファイル> [出力ファイ
 - `WHISPER_MODEL`（モデルファイルを手動指定）
 - `WHISPER_THREADS`（スレッド数）
 - `WHISPER_LANGUAGE`（言語、例: `ja`）
+- `WHISPER_PREFLIGHT_NORMALIZE`（`1` のとき変換時に loudnorm を適用）
+- `WHISPER_MODE`（`single-pass` / `segmented` を強制）
+- `WHISPER_JOBS`（分割並列時の並列数）
+- `WHISPER_SEGMENT_TIME`（分割秒数）
+- `WHISPER_FORCE_CPU`（`1` のとき GPU を使わず `-ng` で実行）
+- `WHISPER_THREADS` 未指定時:
+  - `single-pass`: CPUコア数を使用
+  - `segmented`: `CPUコア数 / JOBS` を各ジョブに自動割当
+- `WHISPER_USE_VAD`（`1` のとき VAD 有効）
+- `WHISPER_VAD_ALLOW_SEGMENTED`（`1` で分割並列でもVADを強制。既定は安定性優先で無効化）
+- `WHISPER_VAD_MODEL`（VADモデルのパス。例: `~/.cache/whisper-cpp/ggml-silero-v6.2.0.bin`）
+- `WHISPER_VAD_CPU_ONLY`（既定 `1`。VAD有効時は `-ng` でCPU実行し安定性優先。`0` でGPU試行）
 
-### GUI アプリで実行
+### Preflight 診断（CLI）
 
-`tkinter` が使えるか先に確認します。
+アップロード前の入力診断を単体で実行できます。
 
 ```bash
-python3 -m tkinter
+./preflight.sh <音声ファイル> [accuracy|balanced|speed]
 ```
 
-GUI を起動します。
+出力は JSON です。主な項目:
+
+- `verdict`（`OK` / `NEEDS_CORRECTION` / `NOT_RECOMMENDED`）
+- `reasons`
+- `corrections`（例: `volume_normalize`）
+- `input`（container/codec/duration/mean_volume/silence_ratio/convertible など）
+- `recommended_preset`
+
+注記:
+- `mean_volume_db` / `silence_ratio` は先頭サンプル（既定60秒）から算出します。
+- サンプル長は `WHISPER_PREFLIGHT_SCAN_SEC` で変更できます（1〜300秒）。
+
+### Web GUI で実行
+
+推奨起動:
 
 ```bash
-python3 whisper_gui.py
+./WhisperDialog.command
+```
+
+直接起動:
+
+```bash
+python3 whisper_gui_web.py
 ```
 
 機能:
 
-1. 音声ファイル選択
-2. 出力先（Save As）選択
-3. 実行中ログ表示（stdout/stderr）
-4. 実行中の二重起動防止
-5. Cancel ボタンで処理中断（子プロセスも停止）
-6. 速度プリセット選択（`x1/x4/x8/x16`）と精度目安の表示
-7. Advanced で `single-pass` / `分割並列` を切替、並列ジョブ数（`JOBS`）を指定可能（上限4）
-8. Advanced の自動サフィックス保存で、比較実験時に設定別ファイル（例: `_x4_parallel_j2`）を自動作成
-9. 「比較実行」ボタンで `x1/x4/x8/x16 × single/parallel` を連続実行し、CSV付きで保存
+1. 音声アップロード時の自動 Preflight 診断
+2. 診断結果カード表示（OK / 要補正 / 非推奨）
+3. 優先度セレクタ（精度優先 / バランス / 速度優先）
+4. 推薦プリセットの自動設定（手動上書き可）
+5. 実行モード選択（`最適自動選択` / `カスタム指定`）
+6. カスタム指定時に `単一パス` / `分割並列` を選択可能
+7. 分割並列の `jobs` / `segment秒` をカスタム可能
+8. 自動補正チェック（必要時 `loudnorm` を適用）
+9. 失敗理由と次アクションの表示
+10. 実行中ログ表示（10秒ごとに、経過時間・推定残り時間を追記）
+11. Cancel ボタンで処理中断（子プロセスも停止）
+12. 診断カードと実行情報に推定処理時間（目安レンジ）を表示
+13. 一度セットした入力ファイルを保持し、優先度/プリセット変更時も再選択なしで再診断可能
+14. 分割並列で一部セグメント失敗時も、成功分を結合した部分結果を保存（`*.failed_segments.txt` を併記）
+15. GUI から「失敗区間の追補実行」が可能（失敗一覧モード / 時刻範囲モード）
+16. 時刻範囲モードでは `00:10:00-00:12:30, 00:31:00` のように指定すると、対象セグメントを自動算出して追補
+
+部分結果からの追補（失敗区間のみ再実行）:
+
+```bash
+./retry_failed_segments.sh <元音声> <部分結果.txt> [失敗一覧.txt] [追補後出力.txt]
+```
+
+- 既定の失敗一覧は `<部分結果.txt>.failed_segments.txt`
+- 追補後出力の既定は `<部分結果>.recovered.txt`
+- 元実行時の `SEGMENT_TIME` は `<部分結果.txt>.recovery_meta` から自動読込
+- 自動読込できない場合は `WHISPER_SEGMENT_TIME=...` を指定
+
+GUI 追補の使い方:
+
+1. 通常実行後、`失敗区間の追補実行` カードを開く
+2. 追補方式を選ぶ
+3. `失敗一覧から再実行`:
+   - `<部分結果>.failed_segments.txt` を使って残りだけ再実行
+4. `時刻範囲を指定`:
+   - 例: `00:10:00-00:12:30, 00:31:00`
+   - 分割秒は空欄なら `.recovery_meta` から自動読込（必要時は手入力）
+5. `追補実行` を押すと、`<部分結果>.recovered.txt` に追補統合結果を出力
+
+モード自動選択の既定:
+
+- 15分未満: 単一パス
+- 15〜30分: 分割並列（180秒分割ベース）
+- 30〜60分: 分割並列（150秒分割ベース）
+- 60〜120分: 分割並列（120秒分割ベース）
+- 120分以上: 分割並列（90秒分割ベース）
+- `priority` と `preset` に応じて `jobs` / `segment秒` は自動補正されます（`accuracy` は保守的、`speed` は積極的）
+
+VAD:
+
+- Web GUI では既定で OFF（必要時のみチェックでON）
+- 既定では単一パス時のみ有効（分割並列では安定性優先で自動無効）
+- CLI では `WHISPER_USE_VAD=1` で有効化（必要なら `WHISPER_VAD_ALLOW_SEGMENTED=1` で分割並列にも強制）
+- VADモデルが見つからない場合は自動で無効化されます
+- VAD有効時に `whisper-cli` が失敗した場合は、安定性のため VADを自動OFFにして再試行します
+- Metal(GPU) 由来のエラー検知時は、その後の実行を CPU 固定モードに切替えて安定性を優先します
 
 補足:
 
-- `whisper_gui.py` は自身の場所を基準に `transcribe_workflow.sh` を解決するため、別の作業ディレクトリから起動しても動作します。
-- 実行ログ末尾に性能指標が表示されます（`Convert/Transcribe/Concat/Total` 秒、`RTF`、`x realtime`）。
-- 分割並列ではセグメント単位で `GPU失敗 -> CPU再実行` とリトライを行います（`WHISPER_RETRY_COUNT` / `WHISPER_RETRY_BACKOFF_SEC`）。
+- `WhisperDialog.command` は既存サーバが動作中でも、`whisper_gui_web.py` 更新を検知すると自動で再起動します（必要なら `WHISPER_GUI_FORCE_RESTART=1 ./WhisperDialog.command` で強制再起動）。
+- デフォルト保存先: 入力キャッシュ `~/Library/Caches/WhisperGUI`、出力 `~/Downloads/WhisperGUI`
+- 変更する場合は `WHISPER_GUI_CACHE_DIR` / `WHISPER_GUI_OUTPUT_DIR` を指定できます。
 
 ### 自動比較ベンチマーク（CSV出力）
 
@@ -149,8 +228,12 @@ python3 whisper_gui.py
 ```
 ~/whisper-workflow/
 ├── README.md              # この文書
+├── WhisperDialog.command  # macOS起動ランチャー
 ├── install_models.sh      # モデル一括インストール
-├── whisper_gui.py         # GUI アプリ
+├── models/                # 追加モデル（VADなど）
+│   └── ggml-silero-v6.2.0.bin  # VADモデル
+├── preflight.sh           # Preflight診断（JSON出力）
+├── whisper_gui_web.py     # Web GUI
 ├── transcribe_workflow.sh # 自動一括処理スクリプト (推奨)
 ├── benchmark_matrix.sh    # 比較ベンチマーク実行 + CSV出力
 └── transcribe.sh          # 旧・手動用スクリプト

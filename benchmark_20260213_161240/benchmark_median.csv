@@ -1,0 +1,2 @@
+preset,mode,jobs,measure_runs,median_total_sec,median_transcribe_sec,median_rtf_transcribe,median_x_realtime_transcribe,median_peak_rss_bytes,median_empty_segment_rate,median_adjacent_duplicate_rate
+x1,single,1,3,688,686,0.355,2.82,4535599104,n/a,n/a
