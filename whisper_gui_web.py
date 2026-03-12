@@ -19,6 +19,7 @@ import shutil
 import signal
 import socketserver
 import subprocess
+import sys
 import threading
 import time
 from http import HTTPStatus
@@ -30,12 +31,13 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.expanduser(os.environ.get("WHISPER_GUI_CACHE_DIR", "~/Library/Caches/WhisperGUI"))
 UPLOADS_DIR = os.path.join(CACHE_DIR, "uploads")
 LOGS_DIR = os.path.join(CACHE_DIR, "logs")
-OUTPUTS_DIR = os.path.expanduser(os.environ.get("WHISPER_GUI_OUTPUT_DIR", "~/Downloads/WhisperGUI"))
+OUTPUTS_DIR = os.path.expanduser(os.environ.get("WHISPER_GUI_OUTPUT_DIR", "~/Downloads"))
 TRANSCRIBE_SCRIPT = os.path.join(SCRIPT_DIR, "transcribe_workflow.sh")
 PREFLIGHT_SCRIPT = os.path.join(SCRIPT_DIR, "preflight.sh")
 RETRY_SCRIPT = os.path.join(SCRIPT_DIR, "retry_failed_segments.sh")
+MLX_SCRIPT = os.path.join(SCRIPT_DIR, "transcribe_mlx.py")
 
-PRESETS = {"x1", "x4", "x8", "x16"}
+PRESETS = {"x1", "x4", "x8", "x16", "turbo", "x1-turbo"}
 PRIORITIES = {"accuracy", "balanced", "speed"}
 MODE_STRATEGIES = {"auto", "custom"}
 CUSTOM_MODES = {"single-pass", "segmented"}
@@ -129,6 +131,9 @@ def localize_log_line(line: str) -> str:
         ("[recover] output:", "[追補] 出力:"),
         ("[recover] remaining list:", "[追補] 未回復一覧:"),
         ("Force CPU mode:", "CPU固定モード:"),
+        ("[1/3] Converting to 16kHz WAV...", "[1/3] 16kHz WAVへ変換中..."),
+        ("[2/3] Transcribing with mlx-whisper...", "[2/3] mlx-whisperで文字起こし中..."),
+        ("[3/3] Writing output...", "[3/3] 結果を書き出し中..."),
         ("started", "開始"),
         ("completed", "完了"),
         ("failed", "失敗"),
@@ -161,6 +166,10 @@ def recommend_auto_mode(duration_sec: Any, preset: str, priority: str, cpu_count
     half_cpu = max(2, cpu // 2)
     prio = priority if priority in PRIORITIES else "balanced"
     model_preset = preset if preset in PRESETS else "x4"
+
+    if model_preset == "turbo":
+        return {"mode": "single-pass", "jobs": 1, "segment_time": 240,
+                "reason": "mlx-whisperは単一パスで最適処理"}
 
     # Aggressive auto policy: 15+ min uses segmented mode by default.
     if duration >= 120 * 60:
@@ -320,15 +329,26 @@ def default_recovered_output_name(partial_output_path: str) -> str:
     return base + ".recovered.txt"
 
 
+def _unique_path(path: str) -> str:
+    """同名ファイルが存在する場合 _1, _2 ... を付けて重複回避する。"""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    n = 1
+    while os.path.exists(f"{base}_{n}{ext}"):
+        n += 1
+    return f"{base}_{n}{ext}"
+
+
 def resolve_output_path(name_or_path: str, fallback_name: str) -> str:
     raw = (name_or_path or "").strip()
     if raw and os.path.isabs(raw):
-        return raw
+        return _unique_path(raw)
 
     safe = sanitize_filename(raw or fallback_name, fallback_name)
     if not safe.endswith(".txt"):
         safe += ".txt"
-    return os.path.join(OUTPUTS_DIR, safe)
+    return _unique_path(os.path.join(OUTPUTS_DIR, safe))
 
 
 def read_recovery_meta(partial_output_path: str) -> dict[str, str]:
@@ -374,6 +394,8 @@ def estimate_runtime_window_sec(
         "x4": 0.55,
         "x8": 0.30,
         "x16": 0.18,
+        "turbo": 0.15,
+        "x1-turbo": 0.45,
     }.get(p, 0.55)
 
     if m == "segmented":
@@ -426,8 +448,13 @@ def cleanup_dir(path: str, max_age_sec: int, skip_paths: set[str]) -> None:
             pass
 
 
+SSD_MODEL_DIR = "/Volumes/JIRO SSD 1TB/02_開発資産/ai-models/whisper-cpp"
+
+
 def find_vad_model_path() -> str:
     candidates = [
+        os.path.join(SSD_MODEL_DIR, "ggml-silero-v6.2.0.bin"),
+        os.path.join(SSD_MODEL_DIR, "ggml-silero-v5.1.2.bin"),
         os.path.expanduser("~/.cache/whisper-cpp/ggml-silero-v6.2.0.bin"),
         os.path.expanduser("~/.cache/whisper-cpp/ggml-silero-v5.1.2.bin"),
         os.path.join(SCRIPT_DIR, "models", "ggml-silero-v6.2.0.bin"),
@@ -490,6 +517,7 @@ class AppState:
         self.progress_total_segments = 0
         self.progress_completed_segments = 0
         self.progress_completed_ids: set[str] = set()
+        self.progress_last_completed_at = 0.0
         self.estimated_total_sec = 0
         self.estimated_low_sec = 0
         self.estimated_high_sec = 0
@@ -503,18 +531,35 @@ class AppState:
 
         self.cleanup_stale_files()
 
-    def dependencies(self) -> list[str]:
+    def dependencies(self, preset: str = "") -> list[str]:
         missing = []
-        if not os.path.isfile(TRANSCRIBE_SCRIPT):
-            missing.append("transcribe_workflow.sh")
         if not os.path.isfile(PREFLIGHT_SCRIPT):
             missing.append("preflight.sh")
         if not shutil.which("ffmpeg"):
             missing.append("ffmpeg")
         if not shutil.which("ffprobe"):
             missing.append("ffprobe")
-        if not shutil.which("whisper-cli"):
-            missing.append("whisper-cli")
+        if preset == "turbo":
+            try:
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import importlib.util,sys;sys.exit(0 if importlib.util.find_spec('mlx_whisper') else 1)",
+                    ],
+                    capture_output=True, timeout=10,
+                )
+                if result.returncode != 0:
+                    missing.append("mlx-whisper (pip install mlx-whisper)")
+            except Exception:
+                missing.append("mlx-whisper (pip install mlx-whisper)")
+            if not os.path.isfile(MLX_SCRIPT):
+                missing.append("transcribe_mlx.py")
+        else:
+            if not os.path.isfile(TRANSCRIBE_SCRIPT):
+                missing.append("transcribe_workflow.sh")
+            if not shutil.which("whisper-cli"):
+                missing.append("whisper-cli")
         return missing
 
     def cleanup_stale_files(self) -> None:
@@ -552,6 +597,7 @@ class AppState:
             if seg_id not in self.progress_completed_ids:
                 self.progress_completed_ids.add(seg_id)
                 self.progress_completed_segments = len(self.progress_completed_ids)
+                self.progress_last_completed_at = time.time()
             return
 
     def _save_upload(self, item: cgi.FieldStorage) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -618,6 +664,10 @@ class AppState:
         preset: str,
         priority: str,
     ) -> dict[str, Any]:
+        if preset == "turbo":
+            return {"mode": "single-pass", "jobs": 1, "segment_time": 240,
+                    "reason": "mlx-whisperは単一パスで最適処理"}
+
         duration_sec = None
         if isinstance(preflight_result, dict):
             in_data = preflight_result.get("input")
@@ -716,15 +766,15 @@ class AppState:
             if self.running:
                 return False, "すでに実行中です。"
 
-        missing = self.dependencies()
-        if missing:
-            return False, "依存不足: " + ", ".join(missing)
-
         preset = "x4"
         if "preset" in form and form.getfirst("preset"):
             preset = str(form.getfirst("preset")).strip()
         if preset not in PRESETS:
             preset = "x4"
+
+        missing = self.dependencies(preset=preset)
+        if missing:
+            return False, "依存不足: " + ", ".join(missing)
 
         auto_correction = "auto_correction" in form
         use_vad = "use_vad" in form
@@ -749,7 +799,8 @@ class AppState:
         output_name = sanitize_filename(output_name, "transcription_result.txt")
         if not output_name.endswith(".txt"):
             output_name += ".txt"
-        output_file = os.path.join(OUTPUTS_DIR, output_name)
+        output_file = _unique_path(os.path.join(OUTPUTS_DIR, output_name))
+        output_name = os.path.basename(output_file)
 
         with self.lock:
             input_path = self.input_file
@@ -818,30 +869,38 @@ class AppState:
         log_file = os.path.join(LOGS_DIR, f"run_{run_id}.log")
 
         env = os.environ.copy()
-        env["WHISPER_PRESET"] = preset
-        env["WHISPER_MODE"] = resolved_mode
-        if current_force_cpu_mode:
-            env["WHISPER_FORCE_CPU"] = "1"
+        if preset == "turbo":
+            env["WHISPER_LANGUAGE"] = "ja"
+            env["WHISPER_MLX_MODEL"] = "mlx-community/whisper-large-v3-turbo"
+            if normalize_enabled:
+                env["WHISPER_PREFLIGHT_NORMALIZE"] = "1"
+            else:
+                env.pop("WHISPER_PREFLIGHT_NORMALIZE", None)
+            cmd = [sys.executable, MLX_SCRIPT, input_path, output_file]
         else:
-            env.pop("WHISPER_FORCE_CPU", None)
-        if use_vad_effective:
-            env["WHISPER_USE_VAD"] = "1"
-            env["WHISPER_VAD_MODEL"] = vad_model_path
-        else:
-            env.pop("WHISPER_USE_VAD", None)
-            env.pop("WHISPER_VAD_MODEL", None)
-        if resolved_mode == "segmented":
-            env["WHISPER_JOBS"] = str(resolved_jobs)
-            env["WHISPER_SEGMENT_TIME"] = str(resolved_segment_time)
-        else:
-            env.pop("WHISPER_JOBS", None)
-            env.pop("WHISPER_SEGMENT_TIME", None)
-        if normalize_enabled:
-            env["WHISPER_PREFLIGHT_NORMALIZE"] = "1"
-        else:
-            env.pop("WHISPER_PREFLIGHT_NORMALIZE", None)
-
-        cmd = [TRANSCRIBE_SCRIPT, input_path, output_file]
+            env["WHISPER_PRESET"] = preset
+            env["WHISPER_MODE"] = resolved_mode
+            if current_force_cpu_mode:
+                env["WHISPER_FORCE_CPU"] = "1"
+            else:
+                env.pop("WHISPER_FORCE_CPU", None)
+            if use_vad_effective:
+                env["WHISPER_USE_VAD"] = "1"
+                env["WHISPER_VAD_MODEL"] = vad_model_path
+            else:
+                env.pop("WHISPER_USE_VAD", None)
+                env.pop("WHISPER_VAD_MODEL", None)
+            if resolved_mode == "segmented":
+                env["WHISPER_JOBS"] = str(resolved_jobs)
+                env["WHISPER_SEGMENT_TIME"] = str(resolved_segment_time)
+            else:
+                env.pop("WHISPER_JOBS", None)
+                env.pop("WHISPER_SEGMENT_TIME", None)
+            if normalize_enabled:
+                env["WHISPER_PREFLIGHT_NORMALIZE"] = "1"
+            else:
+                env.pop("WHISPER_PREFLIGHT_NORMALIZE", None)
+            cmd = [TRANSCRIBE_SCRIPT, input_path, output_file]
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -866,6 +925,7 @@ class AppState:
             self.progress_total_segments = 0
             self.progress_completed_segments = 0
             self.progress_completed_ids = set()
+            self.progress_last_completed_at = 0.0
             self.estimated_total_sec = estimate_window[0] if estimate_window is not None else 0
             self.estimated_low_sec = estimate_window[1] if estimate_window is not None else 0
             self.estimated_high_sec = estimate_window[2] if estimate_window is not None else 0
@@ -1064,6 +1124,7 @@ class AppState:
             self.progress_total_segments = 0
             self.progress_completed_segments = 0
             self.progress_completed_ids = set()
+            self.progress_last_completed_at = 0.0
             self.estimated_total_sec = est_total
             self.estimated_low_sec = est_low
             self.estimated_high_sec = est_high
@@ -1136,14 +1197,25 @@ class AppState:
                     remaining = max(0, total - done)
                     eta_text = "算出中"
                     speed_text = "-"
+                    # 時間ベース補間: セグメント間の進捗を滑らかに見せる
+                    interpolated_pct = done * 100 / total
                     if done > 0 and now_sec > 0:
+                        avg_sec_per_seg = now_sec / done
                         speed = done / max(1, now_sec)
                         speed_text = f"{speed:.3f} seg/秒"
                         eta_sec = int(round(remaining / speed)) if speed > 0 else 0
                         eta_text = format_duration_ja(eta_sec)
-                    self.ui_message = f"処理中... {now_sec}秒経過 / 完了 {done}/{total} / 残り目安 {eta_text}"
+                        # 最後のセグメント完了からの経過時間で次セグメントの進捗を推定
+                        if done < total and self.progress_last_completed_at > 0:
+                            since_last = time.time() - self.progress_last_completed_at
+                            sub_progress = min(0.95, since_last / avg_sec_per_seg)
+                            interpolated_pct = (done + sub_progress) * 100 / total
+                    elif self.estimated_total_sec > 0:
+                        interpolated_pct = min(95.0, now_sec * 100 / self.estimated_total_sec)
+                    pct_display = min(99, int(interpolated_pct))
+                    self.ui_message = f"処理中... {pct_display}% ({done}/{total}セグメント完了) / 残り目安 {eta_text}"
                     self._write_log(
-                        f"[進行中] {now_sec}秒経過: 完了 {done}/{total}, 速度 {speed_text}, 推定残り {eta_text}\n"
+                        f"[進行中] {now_sec}秒経過: {pct_display}% 完了 {done}/{total}, 速度 {speed_text}, 推定残り {eta_text}\n"
                     )
                 elif self.estimated_total_sec > 0:
                     rem = max(0, self.estimated_total_sec - now_sec)
@@ -1294,7 +1366,7 @@ class AppState:
         raw_log_tail = tail_lines(st["log_file"], 600)
         st["log_tail"] = raw_log_tail
         st["log_tail_ja"] = localize_log_text(raw_log_tail)
-        st["missing_dependencies"] = self.dependencies()
+        st["missing_dependencies"] = self.dependencies(preset=st.get("preset", ""))
         return st
 
 
@@ -1367,11 +1439,14 @@ HTML_TEMPLATE = """<!doctype html>
         <div class=\"row\">
           <label>プリセット</label>
           <select id=\"preset_select\" name=\"preset\">
+            <option value=\"turbo\" {sel_turbo}>turbo (MLX最速)</option>
             <option value=\"x1\" {sel_x1}>x1 (最高精度)</option>
+            <option value=\"x1-turbo\" {sel_x1_turbo}>x1-turbo (高精度高速)</option>
             <option value=\"x4\" {sel_x4}>x4 (高精度)</option>
             <option value=\"x8\" {sel_x8}>x8 (中精度)</option>
             <option value=\"x16\" {sel_x16}>x16 (軽量)</option>
           </select>
+          <span class=\"muted\">turbo: 初回はモデルDL (~1.5GB) が必要</span>
         </div>
         <div class=\"row\">
           <label>実行モード</label>
@@ -1953,7 +2028,9 @@ class Handler(BaseHTTPRequestHandler):
             "preflight_html": self._render_preflight_html(st),
             "run_info_html": self._render_run_info_html(st),
             "recovery_status_html": self._render_recovery_status_html(st, recovery_partial_path),
+            "sel_turbo": "selected" if st.get("preset") == "turbo" else "",
             "sel_x1": "selected" if st.get("preset") == "x1" else "",
+            "sel_x1_turbo": "selected" if st.get("preset") == "x1-turbo" else "",
             "sel_x4": "selected" if st.get("preset") == "x4" else "",
             "sel_x8": "selected" if st.get("preset") == "x8" else "",
             "sel_x16": "selected" if st.get("preset") == "x16" else "",

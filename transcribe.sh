@@ -6,7 +6,17 @@ set -e
 
 SEGMENTS_DIR="${1:-.}"
 OUTPUT_FILE="${2:-transcription.txt}"
-MODEL="${WHISPER_MODEL:-$HOME/.cache/whisper-cpp/ggml-large-v3.bin}"
+SSD_MODEL_DIR="/Volumes/JIRO SSD 1TB/02_開発資産/ai-models/whisper-cpp"
+_DEFAULT_MODEL="ggml-large-v3.bin"
+if [ -z "${WHISPER_MODEL:-}" ]; then
+    if [ -f "$SSD_MODEL_DIR/$_DEFAULT_MODEL" ]; then
+        MODEL="$SSD_MODEL_DIR/$_DEFAULT_MODEL"
+    else
+        MODEL="$HOME/.cache/whisper-cpp/$_DEFAULT_MODEL"
+    fi
+else
+    MODEL="$WHISPER_MODEL"
+fi
 
 if [ ! -f "$MODEL" ]; then
     echo "Error: モデルファイルが見つかりません: $MODEL"

@@ -350,12 +350,15 @@ process_segment_file() {
 
 get_audio_duration_sec() {
     if command -v ffprobe >/dev/null 2>&1; then
-        AUDIO_DURATION_SEC="$(
+        local raw
+        raw="$(
             ffprobe -v error \
                 -show_entries format=duration \
                 -of default=nokey=1:noprint_wrappers=1 \
                 "$WAV_FILE" 2>/dev/null || true
         )"
+        # 浮動小数点を整数に切り捨て (bash は整数演算のみ)
+        AUDIO_DURATION_SEC="${raw%%.*}"
     fi
 }
 
@@ -503,11 +506,21 @@ print_performance_summary() {
     fi
 }
 
+SSD_MODEL_DIR="/Volumes/JIRO SSD 1TB/02_開発資産/ai-models/whisper-cpp"
+resolve_model_path() {
+    local name="$1"
+    if [ -f "$SSD_MODEL_DIR/$name" ]; then
+        echo "$SSD_MODEL_DIR/$name"
+    else
+        echo "$HOME/.cache/whisper-cpp/$name"
+    fi
+}
+
 apply_preset() {
     case "$PRESET" in
         x1)
             MODE="single-pass"
-            [ -n "$MODEL" ] || MODEL="$HOME/.cache/whisper-cpp/ggml-large-v3.bin"
+            [ -n "$MODEL" ] || MODEL="$(resolve_model_path ggml-large-v3.bin)"
             THREADS="${WHISPER_THREADS:-$CPU_THREADS}"
             JOBS="${WHISPER_JOBS:-1}"
             SEGMENT_TIME="${WHISPER_SEGMENT_TIME:-240}"
@@ -515,7 +528,7 @@ apply_preset() {
             ;;
         x4)
             MODE="single-pass"
-            [ -n "$MODEL" ] || MODEL="$HOME/.cache/whisper-cpp/ggml-medium.bin"
+            [ -n "$MODEL" ] || MODEL="$(resolve_model_path ggml-medium.bin)"
             THREADS="${WHISPER_THREADS:-$CPU_THREADS}"
             JOBS="${WHISPER_JOBS:-1}"
             SEGMENT_TIME="${WHISPER_SEGMENT_TIME:-240}"
@@ -523,7 +536,7 @@ apply_preset() {
             ;;
         x8)
             MODE="single-pass"
-            [ -n "$MODEL" ] || MODEL="$HOME/.cache/whisper-cpp/ggml-small.bin"
+            [ -n "$MODEL" ] || MODEL="$(resolve_model_path ggml-small.bin)"
             THREADS="${WHISPER_THREADS:-$CPU_THREADS}"
             JOBS="${WHISPER_JOBS:-1}"
             SEGMENT_TIME="${WHISPER_SEGMENT_TIME:-240}"
@@ -531,14 +544,22 @@ apply_preset() {
             ;;
         x16)
             MODE="single-pass"
-            [ -n "$MODEL" ] || MODEL="$HOME/.cache/whisper-cpp/ggml-tiny.bin"
+            [ -n "$MODEL" ] || MODEL="$(resolve_model_path ggml-tiny.bin)"
             THREADS="${WHISPER_THREADS:-$CPU_THREADS}"
             JOBS="${WHISPER_JOBS:-1}"
             SEGMENT_TIME="${WHISPER_SEGMENT_TIME:-240}"
             ACCURACY_HINT="low-medium"
             ;;
+        x1-turbo)
+            MODE="single-pass"
+            [ -n "$MODEL" ] || MODEL="$(resolve_model_path ggml-large-v3-turbo.bin)"
+            THREADS="${WHISPER_THREADS:-$CPU_THREADS}"
+            JOBS="${WHISPER_JOBS:-1}"
+            SEGMENT_TIME="${WHISPER_SEGMENT_TIME:-240}"
+            ACCURACY_HINT="high (turbo)"
+            ;;
         custom|"")
-            [ -n "$MODEL" ] || MODEL="$HOME/.cache/whisper-cpp/ggml-large-v3.bin"
+            [ -n "$MODEL" ] || MODEL="$(resolve_model_path ggml-large-v3.bin)"
             ACCURACY_HINT="depends on model/profile"
 
             # Backward-compatible behavior when user selects custom mode.
@@ -550,7 +571,7 @@ apply_preset() {
             fi
             ;;
         *)
-            echo "Error: Unsupported WHISPER_PRESET '$PRESET' (use x1, x4, x8, x16, custom)"
+            echo "Error: Unsupported WHISPER_PRESET '$PRESET' (use x1, x4, x8, x16, x1-turbo, custom)"
             exit 1
             ;;
     esac
@@ -597,6 +618,8 @@ apply_preset() {
 
     if [ "$USE_VAD" = "1" ] && [ -z "$VAD_MODEL" ]; then
         for candidate in \
+            "$SSD_MODEL_DIR/ggml-silero-v6.2.0.bin" \
+            "$SSD_MODEL_DIR/ggml-silero-v5.1.2.bin" \
             "$HOME/.cache/whisper-cpp/ggml-silero-v6.2.0.bin" \
             "$HOME/.cache/whisper-cpp/ggml-silero-v5.1.2.bin" \
             "$SCRIPT_DIR/models/ggml-silero-v6.2.0.bin" \
@@ -676,6 +699,7 @@ RECOVERY_META_FILE="${OUTPUT_FILE}.recovery_meta"
 mkdir -p "$WORK_DIR"
 mkdir -p "$SEGMENTS_DIR"
 mkdir -p "$TXT_DIR"
+mkdir -p "$(dirname "$OUTPUT_FILE")"
 rm -f -- "$FAILED_SEGMENTS_FILE"
 rm -f -- "$RECOVERY_META_FILE"
 
@@ -741,6 +765,7 @@ if [ "$MODE" = "single-pass" ]; then
     fi
     TRANSCRIBE_DURATION_SEC=$((SECONDS - stage_start_sec))
     printf "%s\n" "$result" > "$OUTPUT_FILE"
+    SEGMENT_SUCCESSFUL=1
     CONCAT_DURATION_SEC=0
     total_duration_sec=$((SECONDS - SCRIPT_START_SEC))
     print_performance_summary "$total_duration_sec" "1"
@@ -769,6 +794,7 @@ if [ "$SEGMENT_COUNT" -eq 0 ]; then
     exit 1
 fi
 msg_info "[3/4] セグメントを並列文字起こし中 ($SEGMENT_COUNT 個のセグメント, $JOBS 並列)..."
+echo "Segments: $SEGMENT_COUNT"
 
 # セグメント処理関数（進捗表示付き）
 process_segment_with_progress() {
@@ -780,6 +806,7 @@ process_segment_with_progress() {
     txtfile="$TXT_DIR/${filename}.txt"
 
     if process_segment_file "$file"; then
+        echo "[3/4] Completed $filename"
         # 成功時にカウンターを更新
         if [ -f "$WORK_DIR/.success_count" ]; then
             local count
@@ -839,13 +866,11 @@ stage_start_sec=$SECONDS
 (
     while true; do
         if [ -f "$WORK_DIR/.processed_count" ]; then
-            local processed
             processed=$(cat "$WORK_DIR/.processed_count" 2>/dev/null || echo 0)
             show_progress "$processed" "$SEGMENT_COUNT" "処理中"
         fi
         sleep 0.3
         # すべてのtxtファイルが生成されたら終了
-        local txt_count
         txt_count=$(find "$TXT_DIR" -name "segment_*.txt" 2>/dev/null | wc -l | tr -d ' ')
         if [ "$txt_count" -ge "$SEGMENT_COUNT" ]; then
             break
@@ -860,7 +885,6 @@ set +e
 find "$SEGMENTS_DIR" -name "segment_*.wav" | sort | \
 xargs -P "$JOBS" -I {} bash -c '
     process_segment_with_progress "$1"
-    local processed
     processed=$(cat "$WORK_DIR/.processed_count" 2>/dev/null || echo 0)
     echo $((processed + 1)) > "$WORK_DIR/.processed_count"
 ' _ {}

@@ -7,17 +7,27 @@
 
 set -euo pipefail
 
-CACHE_DIR="${WHISPER_MODEL_DIR:-$HOME/.cache/whisper-cpp}"
+SSD_MODEL_DIR="/Volumes/JIRO SSD 1TB/02_開発資産/ai-models/whisper-cpp"
+if [ -z "${WHISPER_MODEL_DIR:-}" ]; then
+    if [ -d "$SSD_MODEL_DIR" ]; then
+        CACHE_DIR="$SSD_MODEL_DIR"
+    else
+        CACHE_DIR="$HOME/.cache/whisper-cpp"
+    fi
+else
+    CACHE_DIR="$WHISPER_MODEL_DIR"
+fi
 BASE_URL="${WHISPER_MODEL_BASE_URL:-https://huggingface.co/ggerganov/whisper.cpp/resolve/main}"
 FORCE=0
 
 usage() {
     cat <<'EOF'
-Usage: ./install_models.sh [x1|x4|x8|x16|all] [--force]
+Usage: ./install_models.sh [x1|x4|x8|x16|x1-turbo|all] [--force]
 
 Examples:
   ./install_models.sh
   ./install_models.sh x4 x8
+  ./install_models.sh x1-turbo
   ./install_models.sh all --force
 EOF
 }
@@ -28,6 +38,7 @@ model_name_for_preset() {
         x4) echo "ggml-medium.bin" ;;
         x8) echo "ggml-small.bin" ;;
         x16) echo "ggml-tiny.bin" ;;
+        x1-turbo) echo "ggml-large-v3-turbo.bin" ;;
         *) return 1 ;;
     esac
 }
@@ -59,7 +70,7 @@ mkdir -p "$CACHE_DIR"
 
 declare -a presets=()
 if [ "$#" -eq 0 ]; then
-    presets=(x1 x4 x8 x16)
+    presets=(x1 x4 x8 x16 x1-turbo)
 else
     for arg in "$@"; do
         case "$arg" in
@@ -67,9 +78,9 @@ else
                 FORCE=1
                 ;;
             all)
-                presets=(x1 x4 x8 x16)
+                presets=(x1 x4 x8 x16 x1-turbo)
                 ;;
-            x1|x4|x8|x16)
+            x1|x4|x8|x16|x1-turbo)
                 presets+=("$arg")
                 ;;
             -h|--help)

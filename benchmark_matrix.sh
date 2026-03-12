@@ -37,14 +37,21 @@ is_non_negative_int() {
     esac
 }
 
+SSD_MODEL_DIR="/Volumes/JIRO SSD 1TB/02_開発資産/ai-models/whisper-cpp"
 model_for_preset() {
+    local name
     case "$1" in
-        x1) echo "$HOME/.cache/whisper-cpp/ggml-large-v3.bin" ;;
-        x4) echo "$HOME/.cache/whisper-cpp/ggml-medium.bin" ;;
-        x8) echo "$HOME/.cache/whisper-cpp/ggml-small.bin" ;;
-        x16) echo "$HOME/.cache/whisper-cpp/ggml-tiny.bin" ;;
+        x1) name="ggml-large-v3.bin" ;;
+        x4) name="ggml-medium.bin" ;;
+        x8) name="ggml-small.bin" ;;
+        x16) name="ggml-tiny.bin" ;;
         *) return 1 ;;
     esac
+    if [ -f "$SSD_MODEL_DIR/$name" ]; then
+        echo "$SSD_MODEL_DIR/$name"
+    else
+        echo "$HOME/.cache/whisper-cpp/$name"
+    fi
 }
 
 extract_seconds() {
